@@ -1,0 +1,7 @@
+pipeline,run,elapsed_seconds
+RDD,1,7.8564
+RDD,2,8.9254
+RDD,3,8.2478
+DataFrame,1,12.5987
+DataFrame,2,11.4047
+DataFrame,3,13.1842

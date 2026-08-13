@@ -1,0 +1,142 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Aplicación híbrida de procesamiento Big Data en entorno serverless.
+  Etapa 1 (GPU/OpenMP) + Etapa 2 (Spark RDD/DataFrame vía EMR Serverless)
+  + Etapa 3 (orquestación Akka en Fargate) + Etapa 4 (API Gateway HTTP).
+
+Globals:
+  Function:
+    Timeout: 840
+    MemorySize: 3008
+    Runtime: python3.12
+
+Resources:
+
+  # ---------------------------------------------------------------
+  # Etapa 1: preprocesamiento GPU/OpenMP
+  # ---------------------------------------------------------------
+  GpuPreprocessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: finanzen-bigdata-gpu-preprocess
+      Handler: handler.lambda_handler
+      CodeUri: ../gpu-preprocess-lambda/
+      # Para inferencia real en GPU: imagen de contenedor sobre base
+      # NVIDIA CUDA + capa de drivers, ejecutando en instancias con
+      # aceleradores (Lambda no ofrece GPU nativa; se referencia una
+      # arquitectura equivalente vía SageMaker Processing / EC2 g4dn
+      # detrás de esta función cuando USE_GPU=true).
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref PreprocessedBucket
+          USE_GPU: "false"
+          CPU_BINARY_PATH: /opt/bin/normalize_omp_io
+          ORCHESTRATOR_QUEUE: !Ref OrchestratorQueue
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref PreprocessedBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt OrchestratorQueue.QueueName
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /preprocess
+            Method: POST
+
+  # ---------------------------------------------------------------
+  # Etapa 2: disparo de jobs Spark (EMR Serverless)
+  # ---------------------------------------------------------------
+  SparkTriggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: finanzen-bigdata-spark-trigger
+      Handler: handler.lambda_handler
+      CodeUri: ../spark-jobs/lambda_spark_trigger/
+      Environment:
+        Variables:
+          EMR_APPLICATION_ID: !Ref EmrServerlessApplicationId
+          EMR_EXECUTION_ROLE: !GetAtt EmrExecutionRole.Arn
+          SCRIPTS_BUCKET: !Ref ScriptsBucket
+          OUTPUT_BUCKET: !Ref ResultsBucket
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - emr-serverless:StartJobRun
+                - emr-serverless:GetJobRun
+              Resource: "*"
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /spark-job
+            Method: POST
+
+  # ---------------------------------------------------------------
+  # Etapa 3: orquestador Akka (contenedor persistente en Fargate,
+  # NO como función Lambda — el modelo de actores requiere estado
+  # y ciclo de vida largo, incompatible con la ejecución efímera
+  # de Lambda). Se define aquí solo el servicio ECS asociado.
+  # ---------------------------------------------------------------
+  OrchestratorCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: bigdata-orchestrator-cluster
+
+  OrchestratorQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: bigdata-orchestrator-events
+      VisibilityTimeout: 900
+
+  # ---------------------------------------------------------------
+  # Buckets S3 (almacenamiento intermedio, equivalente a HDFS)
+  # ---------------------------------------------------------------
+  PreprocessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: finanzen-bigdata-preprocessed
+
+  ScriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: finanzen-bigdata-scripts
+
+  ResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: finanzen-bigdata-results
+
+  EmrExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: emr-serverless.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: emr-s3-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource:
+                  - !Sub "${ScriptsBucket.Arn}/*"
+                  - !Sub "${ResultsBucket.Arn}/*"
+                  - !Sub "${PreprocessedBucket.Arn}/*"
+
+Parameters:
+  EmrServerlessApplicationId:
+    Type: String
+    Description: ID de la aplicación EMR Serverless (tipo SPARK) creada previamente.
+
+Outputs:
+  ApiEndpoint:
+    Description: URL base de API Gateway para las funciones serverless
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
